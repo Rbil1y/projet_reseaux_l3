@@ -125,6 +125,20 @@ Le projet VPN Site-to-Site consiste à interconnecter de manière sécurisée de
 
 Afin d'isoler le trafic privé du FAI et des tiers, un tunnel cryptographique IPsec est configuré de manière exclusive entre les routeurs frontières R1 et R3. Les paquets privés transitant d'un site à un autre sont intégralement chiffrés et masqués avant d'être acheminés sur le WAN.
 
+### Cycle de vie d'un paquet à travers le tunnel VPN
+
+Pour mieux appréhender le fonctionnement des protocoles de sécurité, voici les étapes de transit d'un flux de données (par exemple, un ping ICMP depuis le PC1 du Site A vers le PC4 du Site B) :
+
+1. **Génération** : Le PC1 (192.168.1.10) génère un paquet IP standard à destination du PC4 (192.168.2.10).
+2. **Acheminement local** : Le paquet transite par le commutateur local et atteint l'interface de passerelle par défaut du routeur R1 (192.168.1.1).
+3. **Analyse du trafic d'intérêt (ACL 100)** : Le routeur R1 consulte son plan de routage et constate que le paquet doit sortir par l'interface WAN (Gig0/0/1). Avant l'envoi, il le compare à son ACL de chiffrement. Le paquet correspond à la règle `permit ip 192.168.1.0 0.0.0.255 192.168.2.0 0.0.0.255`.
+4. **Négociations des clés et de la sécurité (IKE)** :
+   * **Phase I (ISAKMP)** : Si aucun tunnel de contrôle n'est déjà actif, R1 et R3 négocient et établissent une association de sécurité ISAKMP temporaire pour s'authentifier de manière sûre via la clé `cisc0123`.
+   * **Phase II (IPsec)** : Sous la protection du canal établi en Phase I, R1 et R3 créent les clés de session de données et s'accordent sur le Transform-Set (chiffrement AES et intégrité SHA).
+5. **Chiffrement et Encapsulation ESP** : R1 applique le protocole **ESP** (Encapsulating Security Payload). Il prend le paquet IP original, le chiffre entièrement en AES, y accole une signature cryptographique SHA d'intégrité, et l'encapsule dans une nouvelle en-tête IP externe publique (Source : 203.0.113.1, Destination : 203.0.113.6).
+6. **Transit WAN public** : Le routeur central (Router 2 / FAI) achemine ce paquet encapsulé uniquement sur la base des adresses publiques. Pour l'opérateur, le trafic ressemble à un flux ESP standard, et les adresses privées d'origine restent totalement invisibles.
+7. **Réception et Déchiffrement** : Le routeur distant R3 reçoit le paquet sur son WAN, vérifie la signature d'intégrité, retire l'en-tête publique externe ESP, déchiffre la charge utile originale pour récupérer le paquet initial en clair, et le transmet vers le commutateur du Site B pour qu'il soit délivré à la machine cible PC4.
+
 ### Tableau d'Adressage IP Général du Projet
 
 | Équipement | Interface | Adresse IP | Masque | Passerelle |
@@ -178,8 +192,8 @@ Configuration des adresses IP WAN sur GigabitEthernet0/0 et GigabitEthernet0/2 d
 ![Figure 8](images/image8.png)  
 **Figure 8 :** Configuration des adresses IP WAN et des routes de transit statiques sur le routeur central du fournisseur d'accès (Router 2).
 
-### 4. Configuration ISAKMP (Phase I) sur le Routeur Site A
-Création de la politique ISAKMP 10 (chiffrement AES, intégrité SHA, authentification par clé prépartagée) sur Router 1.
+### 4. Configuration ISAKMP (Phase I - Établissement du canal de contrôle) sur le Routeur Site A
+Création de la politique ISAKMP 10 (chiffrement AES, intégrité SHA, authentification par clé prépartagée) sur Router 1. La Phase I a pour rôle exclusif d'établir un canal de communication sécurisé et authentifié (ISAKMP SA) entre les routeurs homologues afin de protéger les négociations ultérieures de clés.
 
 ![Figure 9](images/image9.png)  
 **Figure 9 :** Initialisation des interfaces LAN/WAN et configuration initiale de la politique ISAKMP (Phase I) sur le routeur local Site A (Router 1).
@@ -189,8 +203,8 @@ Définition de la clé d'authentification pre-shared `cisc0123` liée à l'IP pu
 ![Figure 10](images/image10.png)  
 **Figure 10 :** Définition de la politique de sécurité ISAKMP et de la clé secrète prépartagée sur le routeur principal du Site A.
 
-### 5. Configuration IPsec (Phase II) et Crypto Map sur Router 1
-Création du Transform-Set `MYSET` (esp-aes esp-sha-hmac), définition de l'ACL 100 de trafic d'intérêt, et liaison de la Crypto Map `MYMAP` à GigabitEthernet0/0/1.
+### 5. Configuration IPsec (Phase II - Établissement du tunnel de données) et Crypto Map sur Router 1
+Création du Transform-Set `MYSET` (esp-aes esp-sha-hmac), définition de l'ACL 100 de trafic d'intérêt, et liaison de la Crypto Map `MYMAP` à GigabitEthernet0/0/1. La Phase II s'appuie sur le canal chiffré de la Phase I pour créer le tunnel de données proprement dit (IPsec SA), dans lequel transitent les flux d'intérêt définis par l'ACL.
 
 ![Figure 11](images/image11.png)  
 **Figure 11 :** Déclaration de l'ACL de cryptage, du Transform-Set IPsec (Phase II) et liaison de la Crypto Map à l'interface WAN du routeur Router 1.
@@ -239,7 +253,8 @@ Vue finale du volet d'événements montrant l'acheminement réussi et la simulat
 Les tests de validation et de diagnostic ont donné d'excellents résultats :
 
 *   **Connectivité totale** : Les PC communiquent à travers le WAN de manière transparente avec un temps de réponse minimal après établissement du tunnel.
-*   **Chiffrement actif** : Les statistiques de la commande `show crypto ipsec sa` montrent l'incrémentation en temps réel des compteurs de chiffrement (encaps/decrypt), prouvant l'application effective de l'algorithme AES.
+*   **Comportement de la première négociation (Délai d'IKE/ARP)** : Lors du tout premier ping entre le Site A et le Site B, le premier paquet ICMP expire systématiquement (`Request timed out`). Ce comportement est tout à fait normal et attendu : le premier paquet est envoyé en clair, détecté comme "trafic d'intérêt" et mis en attente pour déclencher les négociations de Phase I et Phase II. Une fois le tunnel initialisé (ce qui prend quelques millisecondes), les paquets restants transitent avec un taux de réussite de 100%.
+*   **Chiffrement actif** : Les statistiques de la commande `show crypto ipsec sa` montrent l'incrémentation en temps réel des compteurs de chiffrement (`#pkts encaps` et `#pkts decrypt`), prouvant l'application effective et bilatérale de l'algorithme AES pour sécuriser le trafic.
 *   **Isolation FAI** : La table de routage du routeur Router 2 (FAI) prouve que l'opérateur n'a aucune visibilité sur les sous-réseaux privés locaux, les flux transitant de manière encapsulée sous protocole ESP.
 
 ---
